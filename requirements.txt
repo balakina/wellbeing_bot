@@ -1,0 +1,7 @@
+fastmcp
+aiosqlite
+python-dotenv
+starlette
+langgraph
+langchain-mcp-adapters
+langchain-gigachat
