@@ -1,24 +1,62 @@
-# python
+# --------------------
+# Python
+# --------------------
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 *.egg-info/
 dist/
 build/
 
-# venv
+# --------------------
+# Virtual environments
+# --------------------
 .venv/
 venv/
 
-# env/secrets
+# --------------------
+# Env / secrets
+# --------------------
 .env
 
-# sqlite db
+# --------------------
+# Databases
+# --------------------
 *.db
 *.sqlite
 *.sqlite3
 
+# --------------------
+# FAISS / ML artifacts
+# --------------------
+faiss.index*
+*.faiss
+faiss_map.json
+
+# --------------------
+# Logs & temp files
+# --------------------
+*.log
+logs/
+*.bak
+*.tmp
+*.old
+*.backup
+
+# --------------------
 # IDE
+# --------------------
 .vscode/
 .idea/
+
+# --------------------
+# Jupyter
+# --------------------
+.ipynb_checkpoints/
+
+# --------------------
+# OS files
+# --------------------
+.DS_Store
+Thumbs.db
+desktop.ini
