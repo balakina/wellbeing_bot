@@ -26,8 +26,7 @@ def _norm_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return "http://127.0.0.1:8100/mcp"
-    u = u.rstrip("/")
-    return u
+    return u.rstrip("/")
 
 async def get_mcp_client() -> MultiServerMCPClient:
     base = _norm_url(os.getenv("WELLBEING_MCP_URL", "http://127.0.0.1:8100/mcp"))
@@ -127,6 +126,10 @@ def _is_paths(text: str) -> bool:
 
 def _is_reindex(text: str) -> bool:
     return text.strip().lower() in {"reindex", "реиндекс", "переиндекс", "пересобери", "пересобрать"}
+
+def _is_report(text: str) -> bool:
+    t = text.strip().lower()
+    return t in {"report", "отчет", "отчёт", "график", "plot"} or t.startswith(("report ", "отчет ", "отчёт ", "график ", "plot "))
 
 def _is_find_cmd(text: str) -> bool:
     t = text.lower().strip()
@@ -255,7 +258,7 @@ async def llm_daily_summary(llm: GigaChat, summary_json: dict) -> str:
 
 async def llm_answer_from_search(llm: GigaChat, query: str, hits: List[Dict[str, Any]]) -> str:
     if not hits:
-        return "🔎 Ничего не найдено по этому запросу. Попробуй другую форму слова (например: программировала / программир)."
+        return "🔎 Ничего не найдено по этому запросу."
 
     hits_block = _format_hits_for_prompt(hits, max_items=5)
     prompt = f"""Запрос пользователя: {query}
@@ -303,6 +306,9 @@ async def node_route(state: DiaryState, config) -> DiaryState:
 
     if _is_reindex(user):
         return {"route": "reindex"}
+
+    if _is_report(user):
+        return {"route": "report"}
 
     if _is_rating(user):
         if pending:
@@ -395,7 +401,6 @@ async def node_find(state: DiaryState, config) -> DiaryState:
     q = (state.get("find_query") or "").strip()
     mode = (state.get("search_mode") or "word").strip()
 
-    hits: Any = []
     try:
         if mode == "rerank":
             if rerank_tool:
@@ -462,6 +467,32 @@ async def node_reindex(state: DiaryState, config) -> DiaryState:
         out += "\n\n✅ FTS rebuild:\n" + json.dumps(res2, ensure_ascii=False, indent=2)
     return {"out_text": out}
 
+async def node_report(state: DiaryState, config) -> DiaryState:
+    ctx = _ctx(config)
+    report_tool = ctx.get("report_tool")
+    if not report_tool:
+        return {"out_text": "❌ tool export_last_weeks_report не найден на MCP сервере."}
+
+    try:
+        res = await report_tool.ainvoke({"weeks": 4, "out_dir": "reports"})
+    except ToolException as e:
+        return {"out_text": f"❌ Ошибка построения графика: {e}"}
+    except Exception as e:
+        return {"out_text": f"❌ Ошибка построения графика: {repr(e)}"}
+
+    res = _unwrap_tool_text(res) if res is not None else {}
+    plot_path = res.get("plot_path")
+    date_from = res.get("date_from")
+    date_to = res.get("date_to")
+    total_entries = res.get("total_entries")
+
+    lines = [f"📈 График готов ({date_from} → {date_to})."]
+    if total_entries is not None:
+        lines.append(f"- Записей: {total_entries}")
+    if plot_path:
+        lines.append(f"- PNG: {plot_path}")
+    return {"out_text": "\n".join(lines)}
+
 def route_to_next(state: DiaryState) -> str:
     return state.get("route", "new_text")
 
@@ -475,6 +506,7 @@ def build_graph():
     g.add_node("smalltalk", node_smalltalk)
     g.add_node("paths", node_paths)
     g.add_node("reindex", node_reindex)
+    g.add_node("report", node_report)
 
     g.set_entry_point("route")
     g.add_conditional_edges(
@@ -485,6 +517,7 @@ def build_graph():
             "exit": END,
             "paths": "paths",
             "reindex": "reindex",
+            "report": "report",
             "new_text": "new_text",
             "save": "save",
             "need_rating": END,
@@ -501,6 +534,7 @@ def build_graph():
     g.add_edge("smalltalk", END)
     g.add_edge("paths", END)
     g.add_edge("reindex", END)
+    g.add_edge("report", END)
     return g.compile()
 
 async def main():
@@ -522,9 +556,16 @@ async def main():
     debug_tool = next((t for t in tools if t.name == "debug_paths"), None)
     rebuild_tool = next((t for t in tools if t.name == "rebuild_faiss_from_db"), None)
     rebuild_fts_tool = next((t for t in tools if t.name == "rebuild_fts_from_db"), None)
+    report_tool = next((t for t in tools if t.name == "export_last_weeks_report"), None)
 
     if not log_entry_tool:
         print("❌ log_entry tool не найден! Проверь сервер и путь /mcp")
+        return
+    if not search_word_tool:
+        print("❌ search_word tool не найден! (сервер должен иметь FTS5)")
+        return
+    if not semantic_tool:
+        print("❌ search_semantic_only tool не найден! Проверь сервер.")
         return
 
     ctx = {
@@ -537,6 +578,7 @@ async def main():
         "debug_tool": debug_tool,
         "rebuild_tool": rebuild_tool,
         "rebuild_fts_tool": rebuild_fts_tool,
+        "report_tool": report_tool,
     }
 
     graph = build_graph()
@@ -545,10 +587,11 @@ async def main():
     print("Команды:")
     print(" - Напиши текст записи → потом оцени 1–5")
     print(" - 'сводка' / 'итог' / дата YYYY-MM-DD / 'сегодня' → сводка дня")
-    print(" - 'найди <слово/слова>' → поиск по словам (FTS5 + prefix + LIKE fallback)")
+    print(" - 'найди <слово/слова>' → поиск по словам")
     print(" - 'найди! <запрос>' → смысловой поиск (FAISS + rerank)")
     print(" - 'paths' → показать пути + faiss_ntotal")
     print(" - 'reindex' → пересобрать FAISS и FTS")
+    print(" - 'report' / 'отчет' / 'график' → PNG график за 4 недели")
     print(" - 'выход' → выйти")
 
     state: DiaryState = {"pending_text": None}
@@ -557,13 +600,22 @@ async def main():
         user = input("\nТы: ").strip()
         state["user_input"] = user
 
-        _append_jsonl(CONVO_LOG_FILE, {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "role": "user", "text": user})
+        _append_jsonl(CONVO_LOG_FILE, {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "role": "user",
+            "text": user
+        })
 
         new_state = await graph.ainvoke(state, config={"configurable": {"ctx": ctx}})
         out = (new_state.get("out_text") or "").strip()
         if out:
             print("\n" + out)
-            _append_jsonl(CONVO_LOG_FILE, {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "role": "assistant", "text": out, "route": new_state.get("route")})
+            _append_jsonl(CONVO_LOG_FILE, {
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "role": "assistant",
+                "text": out,
+                "route": new_state.get("route")
+            })
 
         state.update(new_state)
 

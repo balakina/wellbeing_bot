@@ -1,4 +1,5 @@
 # server.py
+# ================== OFFLINE / ENV FIRST ==================
 import os
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
@@ -9,6 +10,7 @@ if WELLBEING_OFFLINE:
 
 WELLBEING_PLOT = os.getenv("WELLBEING_PLOT", "matplotlib").lower()
 
+# ================== NORMAL IMPORTS ==================
 from fastmcp import FastMCP
 from typing import List, Dict, Any, Optional
 
@@ -18,6 +20,7 @@ import asyncio
 import json
 import shutil
 import re
+import tempfile
 
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -31,11 +34,12 @@ if WELLBEING_PLOT == "matplotlib":
     try:
         import matplotlib
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt  # noqa: F401
+        import matplotlib.pyplot as plt
         HAVE_MPL = True
     except Exception:
         HAVE_MPL = False
 
+# ================== PATHS / CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DB_PATH = os.getenv("WELLBEING_DB_PATH", os.path.join(BASE_DIR, "wellbeing.db"))
@@ -51,13 +55,18 @@ HOST = os.getenv("WELLBEING_HOST", "0.0.0.0")
 PORT = int(os.getenv("WELLBEING_PORT", "8100"))
 PATH = os.getenv("WELLBEING_PATH", "/mcp")
 
+# Усиление поиска (для FAISS): префиксы + 3-граммы
 AUGMENT_FOR_SEARCH = os.getenv("WELLBEING_AUGMENT_TEXT", "true").lower() == "true"
 AUG_PREFIX_MIN = int(os.getenv("WELLBEING_AUG_PREFIX_MIN", "3"))
 AUG_PREFIX_MAX = int(os.getenv("WELLBEING_AUG_PREFIX_MAX", "5"))
 AUG_CHAR_N = int(os.getenv("WELLBEING_AUG_CHAR_N", "3"))
 AUG_CHAR_MAX = int(os.getenv("WELLBEING_AUG_CHAR_MAX", "120"))
 
-FAISS_PERSIST_EVERY = int(os.getenv("WELLBEING_FAISS_PERSIST_EVERY", "20"))
+# FAISS persist debounce
+FAISS_PERSIST_EVERY = int(os.getenv("WELLBEING_FAISS_PERSIST_EVERY", "20"))  # каждые N добавлений
+
+# Важно: автопересборка FAISS при старте (если индекс пустой, а записи есть)
+AUTO_REINDEX_ON_START = os.getenv("WELLBEING_AUTO_REINDEX_ON_START", "false").lower() == "true"
 
 print("=== WELLBEING SERVER START ===")
 print("BASE_DIR:", BASE_DIR)
@@ -70,8 +79,9 @@ print("ENABLE_RERANK:", ENABLE_RERANK)
 print("WELLBEING_OFFLINE:", WELLBEING_OFFLINE, "(HF_HUB_OFFLINE=", os.getenv("HF_HUB_OFFLINE"), ")")
 print("PLOT:", WELLBEING_PLOT, "HAVE_MPL=", HAVE_MPL)
 print("AUGMENT_FOR_SEARCH:", AUGMENT_FOR_SEARCH)
+print("AUTO_REINDEX_ON_START:", AUTO_REINDEX_ON_START)
 
-# ------------------ DB ------------------
+# ================== DB HELPERS ==================
 async def get_conn():
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
@@ -131,7 +141,7 @@ async def init_db():
     finally:
         await conn.close()
 
-# ------------------ TEXT AUGMENT (FAISS) ------------------
+# ================== TEXT AUGMENT (FOR FAISS ONLY) ==================
 def _basic_tokens(text: str) -> List[str]:
     t = (text or "").lower()
     out, cur = [], []
@@ -181,17 +191,24 @@ def _augment_text(text: str) -> str:
 
     return base + "\n" + "\n".join(extra)
 
-# ------------------ FAISS ------------------
+# ================== FAISS STORE ==================
 class FaissStore:
+    """
+    IndexFlatIP + normalize_embeddings=True => cosine.
+    E5: query:/passage: prefixes.
+    """
     def __init__(self, index_path: str, map_path: str, embed_model_name: str):
         self.index_path = index_path
         self.map_path = map_path
         self.embed_model_name = embed_model_name
+
         self.embedder: Optional[SentenceTransformer] = None
         self.dim: int = 0
+
         self.index: Optional[faiss.Index] = None
         self.id_map: List[int] = []
         self._lock = asyncio.Lock()
+
         self._dirty = 0
 
     def _ensure_embedder(self) -> None:
@@ -254,6 +271,7 @@ class FaissStore:
         else:
             self._create_new_index()
 
+        # dim mismatch -> сброс
         if self.index is not None and getattr(self.index, "d", None) != self.dim:
             print("⚠️ FAISS dim mismatch. index.d=", getattr(self.index, "d", None), "model.dim=", self.dim)
             self._create_new_index()
@@ -275,14 +293,31 @@ class FaissStore:
         else:
             self.id_map = []
 
+        ntotal = int(self.index.ntotal) if self.index else 0
+        if self.index is not None and ntotal != len(self.id_map):
+            print("⚠️ FAISS index/map mismatch:", ntotal, len(self.id_map))
         print("✅ FAISS loaded. ntotal =", int(self.index.ntotal) if self.index else None)
 
     def _persist_sync(self) -> None:
+        """
+        Unicode-safe persist:
+        - FAISS на Windows может не уметь писать в путь с кириллицей.
+        - Поэтому пишем в temp (ASCII), затем shutil.move в нужный путь.
+        """
         if self.index is None:
             return
+
         os.makedirs(os.path.dirname(os.path.abspath(self.index_path)) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(os.path.abspath(self.map_path)) or ".", exist_ok=True)
-        faiss.write_index(self.index, self.index_path)
+
+        tmp_dir = tempfile.gettempdir()
+        tmp_index = os.path.join(tmp_dir, "wellbeing_faiss.index.tmp")
+
+        # пишем туда, где точно нет кириллицы
+        faiss.write_index(self.index, tmp_index)
+        # переносим Python'ом (Unicode OK)
+        shutil.move(tmp_index, self.index_path)
+
         with open(self.map_path, "w", encoding="utf-8") as f:
             json.dump(self.id_map, f, ensure_ascii=False)
 
@@ -326,7 +361,7 @@ class FaissStore:
                 out.append({"entry_id": int(self.id_map[faiss_id]), "score": float(s)})
             return out
 
-# ------------------ RERANK ------------------
+# ================== RERANKER ==================
 class Reranker:
     def __init__(self, model_name: str):
         self.model_name = model_name
@@ -371,7 +406,7 @@ class Reranker:
         enriched.sort(key=lambda x: x["rerank_score"], reverse=True)
         return enriched[:top_n]
 
-# ------------------ SERVER ------------------
+# ================== SERVER ==================
 mcp = FastMCP(
     name="WellbeingDiaryServer",
     instructions="MCP server: SQLite storage + FTS5 word search + FAISS semantic search + optional reranker."
@@ -384,7 +419,7 @@ reranker: Optional[Reranker] = Reranker(RERANK_MODEL_NAME) if ENABLE_RERANK else
 async def health_check(request: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
 
-# ------------------ INTERNAL HELPERS ------------------
+# ================== INTERNAL HELPERS ==================
 async def _db_get_entries_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
     if not ids:
         return []
@@ -424,7 +459,7 @@ async def _impl_search_with_rerank(query: str, top_k: int = 50, top_n: int = 8) 
         return docs[: max(1, int(top_n))]
     return await reranker.rerank_async(query, docs, top_n=int(top_n))
 
-# ------------------ TOOLS ------------------
+# ================== TOOLS ==================
 @mcp.tool
 async def debug_paths() -> Dict[str, Any]:
     return {
@@ -440,6 +475,7 @@ async def debug_paths() -> Dict[str, Any]:
         "have_mpl": HAVE_MPL,
         "augment_text": AUGMENT_FOR_SEARCH,
         "persist_every": FAISS_PERSIST_EVERY,
+        "auto_reindex_on_start": AUTO_REINDEX_ON_START,
     }
 
 @mcp.tool
@@ -482,6 +518,7 @@ async def rebuild_faiss_from_db(batch_size: int = 256) -> Dict[str, Any]:
             store.id_map.extend(ids)
             added += len(ids)
 
+        # persist (unicode-safe)
         await store.persist_async()
         store._dirty = 0
 
@@ -576,16 +613,28 @@ async def get_daily_summary(date: str) -> Dict[str, Any]:
     finally:
         await conn.close()
 
-# ======== ВОТ ТУТ ГЛАВНЫЙ ФИКС: нормальный word search ========
+# -------- FIXED WORD SEARCH (FTS + prefix + LIKE + ё/е) --------
 @mcp.tool
 async def search_word(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     q = (query or "").strip()
     if not q:
         return []
 
+    def variants(s: str) -> List[str]:
+        out = [s]
+        if "е" in s:
+            out.append(s.replace("е", "ё"))
+        if "ё" in s:
+            out.append(s.replace("ё", "е"))
+        seen = set()
+        res = []
+        for x in out:
+            if x not in seen:
+                seen.add(x)
+                res.append(x)
+        return res
+
     toks = _basic_tokens(q)
-    # хотим поймать "программирование" -> "программировала"
-    # берём "стем" как первые 8 букв токена (если токен длинный) и добавляем *
     stems = []
     for t in toks:
         if len(t) >= 4:
@@ -604,13 +653,14 @@ async def search_word(query: str, limit: int = 20) -> List[Dict[str, Any]]:
             LIMIT ?
         """
 
-        variants = []
-        variants.append(q)  # как есть
-        variants.append('"' + q.replace('"', '""') + '"')  # фраза
+        qvars: List[str] = []
+        for qq in variants(q):
+            qvars.append(qq)
+            qvars.append('"' + qq.replace('"', '""') + '"')
         if prefix_or:
-            variants.append(prefix_or)  # префиксами
+            qvars.append(prefix_or)
 
-        for v in variants:
+        for v in qvars:
             try:
                 cur = await conn.execute(sql, (v, int(limit)))
                 rows = await cur.fetchall()
@@ -619,7 +669,6 @@ async def search_word(query: str, limit: int = 20) -> List[Dict[str, Any]]:
             except Exception:
                 continue
 
-        # fallback: LIKE по сырому тексту (на всякий)
         like_sql = """
             SELECT *
             FROM entries
@@ -627,8 +676,13 @@ async def search_word(query: str, limit: int = 20) -> List[Dict[str, Any]]:
             ORDER BY created_at DESC
             LIMIT ?
         """
-        cur = await conn.execute(like_sql, (f"%{q}%", int(limit)))
-        return await cur.fetchall()
+        for qq in variants(q):
+            cur = await conn.execute(like_sql, (f"%{qq}%", int(limit)))
+            rows = await cur.fetchall()
+            if rows:
+                return rows
+
+        return []
     finally:
         await conn.close()
 
@@ -639,6 +693,89 @@ async def search_semantic_only(query: str, top_k: int = 20) -> List[Dict[str, An
 @mcp.tool
 async def search_with_rerank(query: str, top_k: int = 50, top_n: int = 8) -> List[Dict[str, Any]]:
     return await _impl_search_with_rerank(query=query, top_k=top_k, top_n=top_n)
+
+# -------- PNG REPORT TOOL --------
+@mcp.tool
+async def export_last_weeks_report(weeks: int = 4, out_dir: str = "reports") -> Dict[str, Any]:
+    if not HAVE_MPL:
+        return {"status": "skip", "reason": "matplotlib not available"}
+
+    weeks = max(int(weeks), 1)
+    today = datetime.date.today()
+    date_from = today - datetime.timedelta(days=weeks * 7)
+
+    conn = await get_conn()
+    try:
+        cur = await conn.execute(
+            """
+            SELECT created_at, mood_score
+            FROM entries
+            WHERE substr(created_at, 1, 10) >= ?
+            ORDER BY created_at
+            """,
+            (date_from.isoformat(),)
+        )
+        rows = await cur.fetchall()
+    finally:
+        await conn.close()
+
+    by_day: Dict[str, List[int]] = {}
+    for r in rows:
+        d = (r.get("created_at") or "")[:10]
+        m = r.get("mood_score")
+        if not d or m is None:
+            continue
+        by_day.setdefault(d, []).append(int(m))
+
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_path = os.path.join(out_dir, f"mood_{weeks}w_{ts}.png")
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+
+    if not by_day:
+        ax.set_title(f"Mood за последние {weeks} недель")
+        ax.set_xlabel("Дата")
+        ax.set_ylabel("Средний mood")
+        ax.text(0.5, 0.5, "Нет записей за период", ha="center", va="center", transform=ax.transAxes)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        return {
+            "status": "ok",
+            "date_from": date_from.isoformat(),
+            "date_to": today.isoformat(),
+            "total_entries": 0,
+            "plot_path": plot_path
+        }
+
+    days = sorted(by_day.keys())
+    avg_moods = [sum(by_day[d]) / len(by_day[d]) for d in days]
+    counts = [len(by_day[d]) for d in days]
+    total_entries = sum(counts)
+
+    ax.plot(days, avg_moods, marker="o")
+    ax.set_title(f"Mood за последние {weeks} недель ({date_from.isoformat()} → {today.isoformat()})")
+    ax.set_xlabel("Дата")
+    ax.set_ylabel("Средний mood (1–5)")
+    ax.set_ylim(1, 5)
+    ax.tick_params(axis="x", rotation=45)
+
+    for x, y, c in zip(days, avg_moods, counts):
+        ax.annotate(str(c), (x, y), textcoords="offset points", xytext=(0, 6), ha="center")
+
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+
+    return {
+        "status": "ok",
+        "date_from": date_from.isoformat(),
+        "date_to": today.isoformat(),
+        "total_entries": total_entries,
+        "plot_path": plot_path
+    }
 
 @mcp.resource("wellbeing://status")
 async def wellbeing_status() -> str:
@@ -663,6 +800,22 @@ async def wellbeing_status() -> str:
 async def _startup() -> None:
     await init_db()
     store.load_or_create()
+
+    if AUTO_REINDEX_ON_START:
+        conn = await get_conn()
+        try:
+            cur = await conn.execute("SELECT COUNT(*) as c FROM entries")
+            total = int((await cur.fetchone())["c"])
+        finally:
+            await conn.close()
+
+        faiss_total = int(store.index.ntotal) if store.index else 0
+        if total > 0 and faiss_total == 0:
+            print("⚙️ AUTO_REINDEX: DB has entries but FAISS is empty -> rebuilding...")
+            try:
+                await rebuild_faiss_from_db(batch_size=256)
+            except Exception as e:
+                print("❌ AUTO_REINDEX failed:", repr(e))
 
 if __name__ == "__main__":
     asyncio.run(_startup())
