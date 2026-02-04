@@ -1,11 +1,23 @@
+# server.py
+import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+WELLBEING_OFFLINE = os.getenv("WELLBEING_OFFLINE", "true").lower() == "true"
+if WELLBEING_OFFLINE:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+WELLBEING_PLOT = os.getenv("WELLBEING_PLOT", "matplotlib").lower()
+
 from fastmcp import FastMCP
 from typing import List, Dict, Any, Optional
+
 import aiosqlite
-import os
 import datetime
 import asyncio
 import json
 import shutil
+import re
 
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -14,15 +26,22 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
+HAVE_MPL = False
+if WELLBEING_PLOT == "matplotlib":
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # noqa: F401
+        HAVE_MPL = True
+    except Exception:
+        HAVE_MPL = False
 
-# ================== PATHS / CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DB_PATH = os.getenv("WELLBEING_DB_PATH", os.path.join(BASE_DIR, "wellbeing.db"))
 FAISS_INDEX_PATH = os.getenv("WELLBEING_FAISS_INDEX", os.path.join(BASE_DIR, "faiss.index"))
 FAISS_MAP_PATH = os.getenv("WELLBEING_FAISS_MAP", os.path.join(BASE_DIR, "faiss_map.json"))
 
-# E5: используем query:/passage:
 EMBED_MODEL_NAME = os.getenv("WELLBEING_EMBED_MODEL", "intfloat/multilingual-e5-small")
 
 RERANK_MODEL_NAME = os.getenv("WELLBEING_RERANK_MODEL", "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
@@ -32,6 +51,14 @@ HOST = os.getenv("WELLBEING_HOST", "0.0.0.0")
 PORT = int(os.getenv("WELLBEING_PORT", "8100"))
 PATH = os.getenv("WELLBEING_PATH", "/mcp")
 
+AUGMENT_FOR_SEARCH = os.getenv("WELLBEING_AUGMENT_TEXT", "true").lower() == "true"
+AUG_PREFIX_MIN = int(os.getenv("WELLBEING_AUG_PREFIX_MIN", "3"))
+AUG_PREFIX_MAX = int(os.getenv("WELLBEING_AUG_PREFIX_MAX", "5"))
+AUG_CHAR_N = int(os.getenv("WELLBEING_AUG_CHAR_N", "3"))
+AUG_CHAR_MAX = int(os.getenv("WELLBEING_AUG_CHAR_MAX", "120"))
+
+FAISS_PERSIST_EVERY = int(os.getenv("WELLBEING_FAISS_PERSIST_EVERY", "20"))
+
 print("=== WELLBEING SERVER START ===")
 print("BASE_DIR:", BASE_DIR)
 print("DB_PATH:", os.path.abspath(DB_PATH))
@@ -40,18 +67,28 @@ print("FAISS_MAP_PATH:", os.path.abspath(FAISS_MAP_PATH))
 print("EMBED_MODEL_NAME:", EMBED_MODEL_NAME)
 print("RERANK_MODEL_NAME:", RERANK_MODEL_NAME)
 print("ENABLE_RERANK:", ENABLE_RERANK)
+print("WELLBEING_OFFLINE:", WELLBEING_OFFLINE, "(HF_HUB_OFFLINE=", os.getenv("HF_HUB_OFFLINE"), ")")
+print("PLOT:", WELLBEING_PLOT, "HAVE_MPL=", HAVE_MPL)
+print("AUGMENT_FOR_SEARCH:", AUGMENT_FOR_SEARCH)
 
-
-# ================== DB HELPERS ==================
+# ------------------ DB ------------------
 async def get_conn():
     conn = await aiosqlite.connect(DB_PATH)
     conn.row_factory = lambda c, r: dict(zip([col[0] for col in c.description], r))
-    return conn
 
+    def _regexp(pattern: str, text: Optional[str]) -> int:
+        if text is None:
+            return 0
+        try:
+            return 1 if re.search(pattern, text) else 0
+        except Exception:
+            return 0
+
+    await conn.create_function("REGEXP", 2, _regexp)
+    return conn
 
 def now_iso() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
-
 
 async def init_db():
     conn = await get_conn()
@@ -66,46 +103,145 @@ async def init_db():
                 interpretation TEXT
             )
         """)
+        await conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
+            USING fts5(raw_text, tags, content='entries', content_rowid='id')
+        """)
+        await conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+              INSERT INTO entries_fts(rowid, raw_text, tags) VALUES (new.id, new.raw_text, COALESCE(new.tags,''));
+            END
+        """)
+        await conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+              INSERT INTO entries_fts(entries_fts, rowid, raw_text, tags)
+              VALUES('delete', old.id, old.raw_text, COALESCE(old.tags,''));
+            END
+        """)
+        await conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+              INSERT INTO entries_fts(entries_fts, rowid, raw_text, tags)
+              VALUES('delete', old.id, old.raw_text, COALESCE(old.tags,''));
+              INSERT INTO entries_fts(rowid, raw_text, tags)
+              VALUES (new.id, new.raw_text, COALESCE(new.tags,''));
+            END
+        """)
         await conn.commit()
-        print("✅ DB initialized")
+        print("✅ DB initialized (entries + FTS5)")
     finally:
         await conn.close()
 
+# ------------------ TEXT AUGMENT (FAISS) ------------------
+def _basic_tokens(text: str) -> List[str]:
+    t = (text or "").lower()
+    out, cur = [], []
+    for ch in t:
+        ok = ("a" <= ch <= "z") or ("0" <= ch <= "9") or ("а" <= ch <= "я") or (ch == "ё")
+        if ok:
+            cur.append(ch)
+        else:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
 
-# ================== FAISS STORE ==================
+def _augment_text(text: str) -> str:
+    if not AUGMENT_FOR_SEARCH:
+        return (text or "").strip()
+
+    base = (text or "").strip()
+    if not base:
+        return base
+
+    toks = _basic_tokens(base)
+
+    pref = []
+    for w in toks:
+        if len(w) < AUG_PREFIX_MIN:
+            continue
+        for L in range(AUG_PREFIX_MIN, min(AUG_PREFIX_MAX, len(w)) + 1):
+            pref.append(w[:L])
+
+    glued = "".join(toks)
+    grams = []
+    n = max(2, int(AUG_CHAR_N))
+    if len(glued) >= n:
+        for i in range(0, len(glued) - n + 1):
+            grams.append(glued[i:i+n])
+            if len(grams) >= AUG_CHAR_MAX:
+                break
+
+    extra = []
+    if pref:
+        extra.append("pref: " + " ".join(pref[:200]))
+    if grams:
+        extra.append("grams: " + " ".join(grams[:AUG_CHAR_MAX]))
+
+    return base + "\n" + "\n".join(extra)
+
+# ------------------ FAISS ------------------
 class FaissStore:
-    """
-    FAISS IndexFlatIP + normalize_embeddings=True => cosine.
-    E5: query:/passage: prefixes.
-    """
     def __init__(self, index_path: str, map_path: str, embed_model_name: str):
         self.index_path = index_path
         self.map_path = map_path
-
-        self.embedder = SentenceTransformer(embed_model_name)
-        self.dim = int(self.embedder.get_sentence_embedding_dimension())
-
+        self.embed_model_name = embed_model_name
+        self.embedder: Optional[SentenceTransformer] = None
+        self.dim: int = 0
         self.index: Optional[faiss.Index] = None
         self.id_map: List[int] = []
         self._lock = asyncio.Lock()
+        self._dirty = 0
 
-    def _embed(self, texts: List[str], *, is_query: bool) -> np.ndarray:
+    def _ensure_embedder(self) -> None:
+        if self.embedder is not None:
+            return
+        try:
+            self.embedder = SentenceTransformer(self.embed_model_name)
+            self.dim = int(self.embedder.get_sentence_embedding_dimension())
+        except Exception as e:
+            self.embedder = None
+            self.dim = 0
+            print("❌ Embedder init failed:", repr(e))
+            print("   Semantic search disabled until model is available.")
+
+    async def _embed_async(self, texts: List[str], *, is_query: bool) -> np.ndarray:
+        self._ensure_embedder()
+        if self.embedder is None:
+            raise RuntimeError("Embedder not available (offline without cache?)")
+
         prefix = "query: " if is_query else "passage: "
-        texts = [prefix + (t or "").strip() for t in texts]
-        vecs = self.embedder.encode(texts, normalize_embeddings=True)
-        return np.asarray(vecs, dtype="float32")
+        prepared = [_augment_text((t or "").strip()) for t in texts]
+        prepared = [prefix + t for t in prepared]
+
+        def _encode():
+            vecs = self.embedder.encode(prepared, normalize_embeddings=True)
+            return np.asarray(vecs, dtype="float32")
+
+        return await asyncio.to_thread(_encode)
 
     def _create_new_index(self) -> None:
+        self._ensure_embedder()
+        if self.dim <= 0:
+            self.index = None
+            self.id_map = []
+            return
         self.index = faiss.IndexFlatIP(self.dim)
         self.id_map = []
 
     def load_or_create(self) -> None:
-        # 1) load/create faiss index
+        self._ensure_embedder()
+        if self.dim <= 0:
+            print("⚠️ FAISS disabled (no embedder).")
+            self.index = None
+            self.id_map = []
+            return
+
         if os.path.exists(self.index_path):
             try:
                 self.index = faiss.read_index(self.index_path)
             except Exception as e:
-                # битый индекс — переименуем и создадим новый
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 broken_path = self.index_path + f".broken.{ts}"
                 try:
@@ -118,7 +254,10 @@ class FaissStore:
         else:
             self._create_new_index()
 
-        # 2) load map
+        if self.index is not None and getattr(self.index, "d", None) != self.dim:
+            print("⚠️ FAISS dim mismatch. index.d=", getattr(self.index, "d", None), "model.dim=", self.dim)
+            self._create_new_index()
+
         if os.path.exists(self.map_path):
             try:
                 with open(self.map_path, "r", encoding="utf-8") as f:
@@ -136,42 +275,44 @@ class FaissStore:
         else:
             self.id_map = []
 
-        # 3) sanity
-        ntotal = int(self.index.ntotal) if self.index else 0
-        if ntotal != len(self.id_map):
-            print("⚠️ FAISS index/map mismatch:", ntotal, len(self.id_map))
-            # не падаем — просто сообщаем
-
         print("✅ FAISS loaded. ntotal =", int(self.index.ntotal) if self.index else None)
 
-    def persist(self) -> None:
-        try:
-            assert self.index is not None
-            faiss.write_index(self.index, self.index_path)
-            with open(self.map_path, "w", encoding="utf-8") as f:
-                json.dump(self.id_map, f, ensure_ascii=False)
-        except Exception as e:
-            print("❌ FAISS persist FAILED:", repr(e))
-            raise
+    def _persist_sync(self) -> None:
+        if self.index is None:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(self.index_path)) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.map_path)) or ".", exist_ok=True)
+        faiss.write_index(self.index, self.index_path)
+        with open(self.map_path, "w", encoding="utf-8") as f:
+            json.dump(self.id_map, f, ensure_ascii=False)
+
+    async def persist_async(self) -> None:
+        if self.index is None:
+            return
+        await asyncio.to_thread(self._persist_sync)
 
     async def add_entry(self, entry_id: int, text: str) -> None:
         async with self._lock:
-            assert self.index is not None
-            vec = self._embed([text], is_query=False)  # passage
+            if self.index is None:
+                return
+            vec = await self._embed_async([text], is_query=False)
             self.index.add(vec)
             self.id_map.append(int(entry_id))
-            self.persist()
+
+            self._dirty += 1
+            if self._dirty >= max(1, FAISS_PERSIST_EVERY):
+                await self.persist_async()
+                self._dirty = 0
 
     async def search(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
         async with self._lock:
-            assert self.index is not None
-            if self.index.ntotal == 0:
+            if self.index is None or self.index.ntotal == 0:
                 return []
             query = (query or "").strip()
             if not query:
                 return []
 
-            qv = self._embed([query], is_query=True)
+            qv = await self._embed_async([query], is_query=True)
             k = min(max(int(top_k), 1), int(self.index.ntotal))
             scores, idxs = self.index.search(qv, k)
 
@@ -180,29 +321,45 @@ class FaissStore:
 
             out: List[Dict[str, Any]] = []
             for faiss_id, s in zip(idxs, scores):
-                if faiss_id < 0:
-                    continue
-                if faiss_id >= len(self.id_map):
+                if faiss_id < 0 or faiss_id >= len(self.id_map):
                     continue
                 out.append({"entry_id": int(self.id_map[faiss_id]), "score": float(s)})
             return out
 
-
-# ================== RERANKER ==================
+# ------------------ RERANK ------------------
 class Reranker:
     def __init__(self, model_name: str):
-        self.model = CrossEncoder(model_name)
+        self.model_name = model_name
+        self.model: Optional[CrossEncoder] = None
 
-    def rerank(self, query: str, docs: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
+    def _ensure(self) -> None:
+        if self.model is not None:
+            return
+        try:
+            self.model = CrossEncoder(self.model_name)
+        except Exception as e:
+            self.model = None
+            print("⚠️ Reranker init failed:", repr(e))
+            print("   Rerank disabled.")
+
+    async def rerank_async(self, query: str, docs: List[Dict[str, Any]], top_n: int = 5) -> List[Dict[str, Any]]:
         if not docs:
             return []
         query = (query or "").strip()
         if not query:
             return []
-
         top_n = max(int(top_n), 1)
+
+        self._ensure()
+        if self.model is None:
+            return docs[:top_n]
+
         pairs = [(query, d.get("raw_text", "")) for d in docs]
-        scores = self.model.predict(pairs)
+
+        def _predict():
+            return self.model.predict(pairs)
+
+        scores = await asyncio.to_thread(_predict)
         scores = [float(x) for x in scores]
 
         enriched = []
@@ -214,23 +371,20 @@ class Reranker:
         enriched.sort(key=lambda x: x["rerank_score"], reverse=True)
         return enriched[:top_n]
 
-
-# ================== SERVER ==================
+# ------------------ SERVER ------------------
 mcp = FastMCP(
     name="WellbeingDiaryServer",
-    instructions="MCP server: SQLite storage + FAISS semantic search + optional reranker."
+    instructions="MCP server: SQLite storage + FTS5 word search + FAISS semantic search + optional reranker."
 )
 
 store = FaissStore(FAISS_INDEX_PATH, FAISS_MAP_PATH, EMBED_MODEL_NAME)
 reranker: Optional[Reranker] = Reranker(RERANK_MODEL_NAME) if ENABLE_RERANK else None
 
-
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
 
-
-# ================== INTERNAL HELPERS (NOT tools) ==================
+# ------------------ INTERNAL HELPERS ------------------
 async def _db_get_entries_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
     if not ids:
         return []
@@ -247,8 +401,30 @@ async def _db_get_entries_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
     finally:
         await conn.close()
 
+async def _impl_search_semantic_only(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
+    cands = await store.search(query, top_k=int(top_k))
+    if not cands:
+        return []
 
-# ================== TOOLS ==================
+    ids = [int(c["entry_id"]) for c in cands]
+    docs = await _db_get_entries_by_ids(ids)
+
+    score_map = {int(c["entry_id"]): float(c["score"]) for c in cands}
+    for d in docs:
+        d["faiss_score"] = score_map.get(int(d["id"]), None)
+
+    docs.sort(key=lambda x: x.get("faiss_score", -1e9), reverse=True)
+    return docs
+
+async def _impl_search_with_rerank(query: str, top_k: int = 50, top_n: int = 8) -> List[Dict[str, Any]]:
+    docs = await _impl_search_semantic_only(query=query, top_k=int(top_k))
+    if not docs:
+        return []
+    if reranker is None:
+        return docs[: max(1, int(top_n))]
+    return await reranker.rerank_async(query, docs, top_n=int(top_n))
+
+# ------------------ TOOLS ------------------
 @mcp.tool
 async def debug_paths() -> Dict[str, Any]:
     return {
@@ -260,24 +436,14 @@ async def debug_paths() -> Dict[str, Any]:
         "map_len": len(store.id_map),
         "embed_dim": store.dim,
         "rerank_enabled": ENABLE_RERANK,
+        "offline": WELLBEING_OFFLINE,
+        "have_mpl": HAVE_MPL,
+        "augment_text": AUGMENT_FOR_SEARCH,
+        "persist_every": FAISS_PERSIST_EVERY,
     }
-
-
-@mcp.tool
-async def faiss_stats() -> Dict[str, Any]:
-    return {
-        "faiss_ntotal": int(store.index.ntotal) if store.index else None,
-        "map_len": len(store.id_map),
-        "index_path_exists": os.path.exists(FAISS_INDEX_PATH),
-        "map_path_exists": os.path.exists(FAISS_MAP_PATH),
-    }
-
 
 @mcp.tool
 async def rebuild_faiss_from_db(batch_size: int = 256) -> Dict[str, Any]:
-    """
-    Полностью пересобирает FAISS индекс из SQLite (E5 passage:).
-    """
     batch_size = max(int(batch_size), 16)
 
     conn = await get_conn()
@@ -288,6 +454,10 @@ async def rebuild_faiss_from_db(batch_size: int = 256) -> Dict[str, Any]:
         await conn.close()
 
     async with store._lock:
+        store._ensure_embedder()
+        if store.dim <= 0:
+            return {"status": "skip", "reason": "embedder not available", "total_db_rows": len(rows)}
+
         store.index = faiss.IndexFlatIP(store.dim)
         store.id_map = []
 
@@ -300,23 +470,40 @@ async def rebuild_faiss_from_db(batch_size: int = 256) -> Dict[str, Any]:
             texts.append((r["raw_text"] or "").strip())
 
             if len(texts) >= batch_size:
-                vecs = store._embed(texts, is_query=False)
+                vecs = await store._embed_async(texts, is_query=False)
                 store.index.add(vecs)
                 store.id_map.extend(ids)
                 added += len(ids)
                 texts, ids = [], []
 
         if texts:
-            vecs = store._embed(texts, is_query=False)
+            vecs = await store._embed_async(texts, is_query=False)
             store.index.add(vecs)
             store.id_map.extend(ids)
             added += len(ids)
 
-        store.persist()
+        await store.persist_async()
+        store._dirty = 0
 
-    return {"status": "ok", "total_db_rows": len(rows), "added_to_faiss": added,
-            "faiss_ntotal": int(store.index.ntotal), "map_len": len(store.id_map)}
+    return {
+        "status": "ok",
+        "total_db_rows": len(rows),
+        "added_to_faiss": added,
+        "faiss_ntotal": int(store.index.ntotal) if store.index else 0,
+        "map_len": len(store.id_map)
+    }
 
+@mcp.tool
+async def rebuild_fts_from_db() -> Dict[str, Any]:
+    conn = await get_conn()
+    try:
+        await conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+        await conn.commit()
+        cur = await conn.execute("SELECT count(*) as c FROM entries_fts")
+        c = int((await cur.fetchone())["c"])
+        return {"status": "ok", "fts_rows": c}
+    finally:
+        await conn.close()
 
 @mcp.tool
 async def log_entry(raw_text: str, mood_score: int, tags: str = "", interpretation: str = "") -> Dict[str, Any]:
@@ -340,12 +527,8 @@ async def log_entry(raw_text: str, mood_score: int, tags: str = "", interpretati
     finally:
         await conn.close()
 
-    # FAISS add (не даём silently fail)
     try:
-        before = int(store.index.ntotal) if store.index else -1
         await store.add_entry(entry_id, raw_text)
-        after = int(store.index.ntotal) if store.index else -1
-        print(f"✅ FAISS add_entry ok: before={before} after={after} entry_id={entry_id}")
     except Exception as e:
         print("❌ FAISS add_entry FAILED:", repr(e))
 
@@ -360,18 +543,6 @@ async def log_entry(raw_text: str, mood_score: int, tags: str = "", interpretati
             "interpretation": interpretation or ""
         }
     }
-
-
-@mcp.tool
-async def get_last_entries(limit: int = 10) -> List[Dict[str, Any]]:
-    limit = min(max(int(limit), 1), 200)
-    conn = await get_conn()
-    try:
-        cursor = await conn.execute("SELECT * FROM entries ORDER BY id DESC LIMIT ?", (limit,))
-        return await cursor.fetchall()
-    finally:
-        await conn.close()
-
 
 @mcp.tool
 async def get_daily_summary(date: str) -> Dict[str, Any]:
@@ -405,53 +576,69 @@ async def get_daily_summary(date: str) -> Dict[str, Any]:
     finally:
         await conn.close()
 
-
+# ======== ВОТ ТУТ ГЛАВНЫЙ ФИКС: нормальный word search ========
 @mcp.tool
-async def semantic_search(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-    """FAISS candidates: [{entry_id, score}, ...]"""
-    return await store.search(query, top_k=int(top_k))
+async def search_word(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return []
 
+    toks = _basic_tokens(q)
+    # хотим поймать "программирование" -> "программировала"
+    # берём "стем" как первые 8 букв токена (если токен длинный) и добавляем *
+    stems = []
+    for t in toks:
+        if len(t) >= 4:
+            stem = t[: min(len(t), 8)]
+            stems.append(stem + "*")
+    prefix_or = " OR ".join(stems[:10]) if stems else ""
 
-@mcp.tool
-async def get_entries_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
-    return await _db_get_entries_by_ids(ids)
+    conn = await get_conn()
+    try:
+        sql = """
+            SELECT e.*
+            FROM entries_fts AS f
+            JOIN entries AS e ON e.id = f.rowid
+            WHERE entries_fts MATCH ?
+            ORDER BY e.created_at DESC
+            LIMIT ?
+        """
 
+        variants = []
+        variants.append(q)  # как есть
+        variants.append('"' + q.replace('"', '""') + '"')  # фраза
+        if prefix_or:
+            variants.append(prefix_or)  # префиксами
+
+        for v in variants:
+            try:
+                cur = await conn.execute(sql, (v, int(limit)))
+                rows = await cur.fetchall()
+                if rows:
+                    return rows
+            except Exception:
+                continue
+
+        # fallback: LIKE по сырому тексту (на всякий)
+        like_sql = """
+            SELECT *
+            FROM entries
+            WHERE raw_text LIKE ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """
+        cur = await conn.execute(like_sql, (f"%{q}%", int(limit)))
+        return await cur.fetchall()
+    finally:
+        await conn.close()
 
 @mcp.tool
 async def search_semantic_only(query: str, top_k: int = 20) -> List[Dict[str, Any]]:
-    cands = await store.search(query, top_k=int(top_k))
-    if not cands:
-        return []
-
-    ids = [int(c["entry_id"]) for c in cands]
-    docs = await _db_get_entries_by_ids(ids)
-
-    score_map = {int(c["entry_id"]): float(c["score"]) for c in cands}
-    for d in docs:
-        d["faiss_score"] = score_map.get(int(d["id"]), None)
-
-    docs.sort(key=lambda x: x.get("faiss_score", -1e9), reverse=True)
-    return docs
-
+    return await _impl_search_semantic_only(query=query, top_k=top_k)
 
 @mcp.tool
-async def search_with_rerank(query: str, top_k: int = 30, top_n: int = 5) -> List[Dict[str, Any]]:
-    if reranker is None:
-        return await search_semantic_only(query=query, top_k=top_k)
-
-    cands = await store.search(query, top_k=int(top_k))
-    if not cands:
-        return []
-
-    ids = [int(c["entry_id"]) for c in cands]
-    docs = await _db_get_entries_by_ids(ids)
-
-    score_map = {int(c["entry_id"]): float(c["score"]) for c in cands}
-    for d in docs:
-        d["faiss_score"] = score_map.get(int(d["id"]), None)
-
-    return reranker.rerank(query, docs, top_n=int(top_n))
-
+async def search_with_rerank(query: str, top_k: int = 50, top_n: int = 8) -> List[Dict[str, Any]]:
+    return await _impl_search_with_rerank(query=query, top_k=top_k, top_n=top_n)
 
 @mcp.resource("wellbeing://status")
 async def wellbeing_status() -> str:
@@ -465,18 +652,19 @@ async def wellbeing_status() -> str:
             "entries_count": count,
             "faiss_total": faiss_total,
             "timestamp": now_iso(),
-            "rerank_enabled": ENABLE_RERANK
+            "rerank_enabled": ENABLE_RERANK,
+            "offline": WELLBEING_OFFLINE,
+            "have_mpl": HAVE_MPL,
+            "augment_text": AUGMENT_FOR_SEARCH
         }, ensure_ascii=False)
     finally:
         await conn.close()
-
 
 async def _startup() -> None:
     await init_db()
     store.load_or_create()
 
-
 if __name__ == "__main__":
     asyncio.run(_startup())
-    print(f"🚀 http://localhost:{PORT}{PATH}")
+    print(f"🚀 http://127.0.0.1:{PORT}{PATH}")
     mcp.run(transport="streamable-http", host=HOST, port=PORT, path=PATH)

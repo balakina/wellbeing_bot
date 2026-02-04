@@ -32,6 +32,7 @@ venv/
 faiss.index*
 *.faiss
 faiss_map.json
+*.jsonl
 
 # --------------------
 # Logs & temp files
@@ -60,3 +61,9 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --------------------
+# pictures
+# --------------------
+*.png
+*.md

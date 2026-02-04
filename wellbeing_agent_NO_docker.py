@@ -1,30 +1,40 @@
+# agent.py
 import asyncio
 import datetime
 import json
 import os
 import re
-from typing import Optional, TypedDict, Dict, Any, List
+from typing import Optional, TypedDict, Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_gigachat.chat_models import GigaChat
+from langchain_core.tools.base import ToolException
 
 print("RUNNING FILE:", __file__)
 load_dotenv()
 
+CONVO_LOG_FILE = os.getenv("WELLBEING_CONVO_LOG", "wellbeing_conversation.jsonl")
 
-# ===================== MCP CLIENT =====================
+def _append_jsonl(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def _norm_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return "http://127.0.0.1:8100/mcp"
+    u = u.rstrip("/")
+    return u
+
 async def get_mcp_client() -> MultiServerMCPClient:
+    base = _norm_url(os.getenv("WELLBEING_MCP_URL", "http://127.0.0.1:8100/mcp"))
     return MultiServerMCPClient({
-        "wellbeing": {
-            "transport": "streamable_http",
-            "url": os.getenv("WELLBEING_MCP_URL", "http://127.0.0.1:8100/mcp/")
-        }
+        "wellbeing": {"transport": "streamable_http", "url": base + "/"}
     })
 
-
-# ===================== LLM =====================
 def build_llm() -> GigaChat:
     creds = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
     if not creds:
@@ -35,8 +45,6 @@ def build_llm() -> GigaChat:
         scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
     )
 
-
-# ===================== PROMPTS =====================
 SYSTEM_TAGS_INTERP_REPLY = """
 Ты — ассистент личного дневника.
 Тебе дают текст записи и оценку настроения 1–5, а также (опционально) похожие прошлые записи.
@@ -75,15 +83,16 @@ SYSTEM_SEARCH_ANSWER = """
 - запрос пользователя
 - найденные записи (если пусто — значит пусто)
 
-ВАЖНО:
-- Если записей нет — так и скажи, и НЕ добавляй даты/факты/смежные темы.
+ЖЁСТКИЕ ПРАВИЛА:
+- Если записей нет — так и скажи. НЕ добавляй смежные темы. НЕ придумывай даты/факты.
 - Никогда не придумывай записи.
 - Используй только найденные записи.
+- Дату выводи СТРОГО как YYYY-MM-DD (из created_at). НЕ меняй формат.
 
 Формат:
-1) 1-2 предложения: что нашлось/не нашлось
-2) 1–5 строк: дата + короткий фрагмент
-3) 1 уточняющий вопрос
+1) 1 предложение: что нашлось/не нашлось
+2) 1–5 строк: YYYY-MM-DD — короткий фрагмент (из raw_text)
+3) 1 короткий вопрос ТОЛЬКО для уточнения запроса (другое слово/форма/контекст/период)
 """.strip()
 
 SYSTEM_SMALLTALK = """
@@ -92,8 +101,6 @@ SYSTEM_SMALLTALK = """
 Если это приветствие/болтовня — предложи записать события и поставить настроение 1–5.
 """.strip()
 
-
-# ===================== HELPERS =====================
 def _today_iso() -> str:
     return datetime.date.today().isoformat()
 
@@ -103,32 +110,37 @@ def _is_rating(text: str) -> bool:
 def _is_exit(text: str) -> bool:
     return text.strip().lower() in {"выход", "exit", "quit"}
 
-def _parse_date(text: str) -> Optional[str]:
-    t = text.lower()
-    m = re.search(r"\b\d{4}-\d{2}-\d{2}\b", t)
-    if m:
-        return m.group(0)
-    if "сегодня" in t:
+def _parse_date_command(text: str) -> Optional[str]:
+    t = text.lower().strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+        return t
+    if t in {"сегодня", "сводка сегодня", "итог сегодня"}:
         return _today_iso()
     return None
 
 def _is_summary(text: str) -> bool:
-    t = text.lower()
-    return ("сводк" in t) or ("итог" in t) or ("резюме" in t) or (_parse_date(text) is not None)
-
-def _is_search(text: str) -> bool:
     t = text.lower().strip()
-    return (
-        t.startswith("найди") or t.startswith("поищи") or t.startswith("поиск")
-        or "что я писал" in t or "что я писала" in t
-    )
+    return t.startswith(("сводка", "итог", "резюме")) or (_parse_date_command(text) is not None)
 
-def _extract_search_query_and_mode(text: str) -> tuple[str, str]:
+def _is_paths(text: str) -> bool:
+    return text.strip().lower() in {"paths", "debug", "статус", "status"}
+
+def _is_reindex(text: str) -> bool:
+    return text.strip().lower() in {"reindex", "реиндекс", "переиндекс", "пересобери", "пересобрать"}
+
+def _is_find_cmd(text: str) -> bool:
+    t = text.lower().strip()
+    return t.startswith(("найди", "поищи", "поиск")) or ("что я писал" in t) or ("что я писала" in t)
+
+def _extract_find_query_and_mode(text: str) -> Tuple[str, str]:
     raw = text.strip()
     low = raw.lower()
 
-    mode = "semantic"
-    if low.startswith("найди!") or low.startswith("поищи!") or low.startswith("поиск!"):
+    if ("что я писал" in low) or ("что я писала" in low):
+        return raw, "rerank"
+
+    mode = "word"
+    if low.startswith(("найди!", "поищи!", "поиск!")):
         mode = "rerank"
 
     for prefix in ("найди!", "поищи!", "поиск!", "найди", "поищи", "поиск"):
@@ -137,12 +149,6 @@ def _extract_search_query_and_mode(text: str) -> tuple[str, str]:
             return q, mode
 
     return raw, mode
-
-def _is_paths(text: str) -> bool:
-    return text.strip().lower() in {"paths", "debug", "статус", "status"}
-
-def _is_reindex(text: str) -> bool:
-    return text.strip().lower() in {"reindex", "реиндекс", "переиндекс", "пересобери", "пересобрать"}
 
 GREETINGS = {"привет", "приветик", "приветики", "хай", "hello", "hi", "йо", "здарова", "добрый день", "доброе утро", "добрый вечер"}
 FEELINGS_MARKERS = ("груст", "тревож", "страш", "бою", "волную", "пережива", "плохо", "одиноко", "злю", "обид", "устал", "выгор", "панику", "рад", "счастлив", "раздраж")
@@ -202,13 +208,7 @@ def _format_hits_for_prompt(hits: List[Dict[str, Any]], max_items: int = 5) -> s
         lines.append(f"- [{meta_s}] {text}")
     return "\n".join(lines) if lines else ""
 
-
 def _unwrap_tool_text(res: Any) -> Any:
-    """
-    langchain_mcp_adapters иногда возвращает список блоков вида:
-    [{'type':'text','text':'{...json...}', ...}]
-    Приведём к dict/str.
-    """
     if isinstance(res, list) and res and isinstance(res[0], dict) and "text" in res[0]:
         txt = res[0]["text"]
         try:
@@ -217,10 +217,7 @@ def _unwrap_tool_text(res: Any) -> Any:
             return txt
     return res
 
-
-# ===================== LLM =====================
-async def llm_tags_interp_reply(llm: GigaChat, raw_text: str, mood_score: int,
-                               similar_hits: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
+async def llm_tags_interp_reply(llm: GigaChat, raw_text: str, mood_score: int, similar_hits: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
     similar_block = ""
     if similar_hits:
         similar_block = "\n\nПохожие прошлые записи:\n" + _format_hits_for_prompt(similar_hits, max_items=3)
@@ -258,7 +255,7 @@ async def llm_daily_summary(llm: GigaChat, summary_json: dict) -> str:
 
 async def llm_answer_from_search(llm: GigaChat, query: str, hits: List[Dict[str, Any]]) -> str:
     if not hits:
-        return "🔎 Ничего не найдено по этому запросу. Попробуй уточнить (другое слово/форма/контекст)."
+        return "🔎 Ничего не найдено по этому запросу. Попробуй другую форму слова (например: программировала / программир)."
 
     hits_block = _format_hits_for_prompt(hits, max_items=5)
     prompt = f"""Запрос пользователя: {query}
@@ -279,22 +276,18 @@ async def llm_smalltalk(llm: GigaChat, user: str) -> str:
     ])
     return (resp.content or "").strip()
 
-
-# ===================== STATE =====================
 class DiaryState(TypedDict, total=False):
     user_input: str
     pending_text: Optional[str]
     route: str
     date: Optional[str]
     out_text: str
-    search_mode: str  # semantic/rerank
-
+    search_mode: str
+    find_query: str
 
 def _ctx(config) -> Dict[str, Any]:
     return config["configurable"]["ctx"]
 
-
-# ===================== NODES =====================
 async def node_route(state: DiaryState, config) -> DiaryState:
     user = (state.get("user_input") or "").strip()
     if not user:
@@ -317,12 +310,12 @@ async def node_route(state: DiaryState, config) -> DiaryState:
         return {"route": "rating_without_text", "out_text": "Сначала напиши текст записи, потом поставь настроение 1–5 🙂"}
 
     if _is_summary(user):
-        date = _parse_date(user) or _today_iso()
+        date = _parse_date_command(user) or _today_iso()
         return {"route": "summary", "date": date}
 
-    if _is_search(user):
-        q, mode = _extract_search_query_and_mode(user)
-        return {"route": "search", "user_input": q, "search_mode": mode}
+    if _is_find_cmd(user):
+        q, mode = _extract_find_query_and_mode(user)
+        return {"route": "find", "find_query": q, "search_mode": mode}
 
     if pending:
         return {"route": "need_rating", "out_text": "😊 Оцени настроение цифрой 1–5:"}
@@ -332,17 +325,15 @@ async def node_route(state: DiaryState, config) -> DiaryState:
 
     return {"route": "new_text"}
 
-
 async def node_new_text(state: DiaryState, config) -> DiaryState:
     user = (state.get("user_input") or "").strip()
     return {"pending_text": user, "out_text": "😊 Оцени настроение 1–5:"}
-
 
 async def node_save(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
     llm = ctx["llm"]
     log_entry_tool = ctx.get("log_entry_tool")
-    semantic_only_tool = ctx.get("semantic_only_tool")  # search_semantic_only
+    semantic_tool = ctx.get("semantic_tool")
 
     pending_text = (state.get("pending_text") or "").strip()
     mood = int((state.get("user_input") or "0").strip())
@@ -350,12 +341,12 @@ async def node_save(state: DiaryState, config) -> DiaryState:
     if not log_entry_tool:
         return {"out_text": "❌ tool log_entry не найден на MCP сервере.", "pending_text": None}
 
-    # Похожие записи (FAISS)
     similar_hits: List[Dict[str, Any]] = []
-    if semantic_only_tool and pending_text:
+    if semantic_tool and pending_text:
         try:
-            similar_hits = await semantic_only_tool.ainvoke({"query": pending_text, "top_k": 15})
-            similar_hits = similar_hits[:3]
+            similar_hits = await semantic_tool.ainvoke({"query": pending_text, "top_k": 15})
+            similar_hits = _unwrap_tool_text(similar_hits)
+            similar_hits = similar_hits[:3] if isinstance(similar_hits, list) else []
         except Exception:
             similar_hits = []
 
@@ -379,7 +370,6 @@ async def node_save(state: DiaryState, config) -> DiaryState:
 
     return {"out_text": "\n\n".join(out_parts).strip(), "pending_text": None}
 
-
 async def node_summary(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
     llm = ctx["llm"]
@@ -394,28 +384,38 @@ async def node_summary(state: DiaryState, config) -> DiaryState:
     text = await llm_daily_summary(llm, summary)
     return {"out_text": f"📊 Сводка за {date}:\n\n{text}"}
 
-
-async def node_search(state: DiaryState, config) -> DiaryState:
+async def node_find(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
     llm = ctx["llm"]
 
-    semantic_only_tool = ctx.get("semantic_only_tool")
+    search_word_tool = ctx.get("search_word_tool")
     rerank_tool = ctx.get("rerank_tool")
+    semantic_tool = ctx.get("semantic_tool")
 
-    query = (state.get("user_input") or "").strip()
-    mode = (state.get("search_mode") or "semantic").strip()
+    q = (state.get("find_query") or "").strip()
+    mode = (state.get("search_mode") or "word").strip()
 
-    if mode == "rerank" and rerank_tool:
-        hits = await rerank_tool.ainvoke({"query": query, "top_k": 30, "top_n": 5})
-    else:
-        if not semantic_only_tool:
-            return {"out_text": "❌ tool search_semantic_only не найден на сервере."}
-        hits = await semantic_only_tool.ainvoke({"query": query, "top_k": 20})
+    hits: Any = []
+    try:
+        if mode == "rerank":
+            if rerank_tool:
+                hits = await rerank_tool.ainvoke({"query": q, "top_k": 30, "top_n": 5})
+            elif semantic_tool:
+                hits = await semantic_tool.ainvoke({"query": q, "top_k": 20})
+            else:
+                hits = []
+        else:
+            if not search_word_tool:
+                return {"out_text": "❌ tool search_word не найден на сервере."}
+            hits = await search_word_tool.ainvoke({"query": q, "limit": 20})
+    except ToolException as e:
+        return {"out_text": f"❌ Ошибка поиска: {e}"}
+    except Exception as e:
+        return {"out_text": f"❌ Ошибка поиска: {repr(e)}"}
 
     hits = _unwrap_tool_text(hits)
-    answer = await llm_answer_from_search(llm, query, hits if isinstance(hits, list) else [])
+    answer = await llm_answer_from_search(llm, q, hits if isinstance(hits, list) else [])
     return {"out_text": answer}
-
 
 async def node_smalltalk(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
@@ -423,7 +423,6 @@ async def node_smalltalk(state: DiaryState, config) -> DiaryState:
     user = (state.get("user_input") or "").strip()
     text = await llm_smalltalk(llm, user)
     return {"out_text": f"🤖 {text}\n\nЕсли хочешь — напиши, что произошло/что чувствуешь, и оцени настроение 1–5."}
-
 
 async def node_paths(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
@@ -434,20 +433,37 @@ async def node_paths(state: DiaryState, config) -> DiaryState:
     res = _unwrap_tool_text(res)
     return {"out_text": "DEBUG PATHS:\n" + json.dumps(res, ensure_ascii=False, indent=2)}
 
-
 async def node_reindex(state: DiaryState, config) -> DiaryState:
     ctx = _ctx(config)
     rebuild_tool = ctx.get("rebuild_tool")
+    rebuild_fts_tool = ctx.get("rebuild_fts_tool")
+
     if not rebuild_tool:
         return {"out_text": "❌ rebuild_faiss_from_db tool не найден на сервере."}
-    res = await rebuild_tool.ainvoke({"batch_size": 256})
-    res = _unwrap_tool_text(res)
-    return {"out_text": "✅ Reindex done:\n" + json.dumps(res, ensure_ascii=False, indent=2)}
 
+    try:
+        res1 = await rebuild_tool.ainvoke({"batch_size": 256})
+        res1 = _unwrap_tool_text(res1)
+    except ToolException as e:
+        return {"out_text": f"❌ Reindex упал: {e}"}
+    except Exception as e:
+        return {"out_text": f"❌ Reindex упал: {repr(e)}"}
+
+    res2 = None
+    if rebuild_fts_tool:
+        try:
+            res2 = await rebuild_fts_tool.ainvoke({})
+            res2 = _unwrap_tool_text(res2)
+        except Exception:
+            res2 = None
+
+    out = "✅ Reindex done:\n" + json.dumps(res1, ensure_ascii=False, indent=2)
+    if res2 is not None:
+        out += "\n\n✅ FTS rebuild:\n" + json.dumps(res2, ensure_ascii=False, indent=2)
+    return {"out_text": out}
 
 def route_to_next(state: DiaryState) -> str:
     return state.get("route", "new_text")
-
 
 def build_graph():
     g = StateGraph(DiaryState)
@@ -455,7 +471,7 @@ def build_graph():
     g.add_node("new_text", node_new_text)
     g.add_node("save", node_save)
     g.add_node("summary", node_summary)
-    g.add_node("search", node_search)
+    g.add_node("find", node_find)
     g.add_node("smalltalk", node_smalltalk)
     g.add_node("paths", node_paths)
     g.add_node("reindex", node_reindex)
@@ -474,21 +490,19 @@ def build_graph():
             "need_rating": END,
             "rating_without_text": END,
             "summary": "summary",
-            "search": "search",
+            "find": "find",
             "smalltalk": "smalltalk",
         }
     )
     g.add_edge("new_text", END)
     g.add_edge("save", END)
     g.add_edge("summary", END)
-    g.add_edge("search", END)
+    g.add_edge("find", END)
     g.add_edge("smalltalk", END)
     g.add_edge("paths", END)
     g.add_edge("reindex", END)
     return g.compile()
 
-
-# ===================== MAIN =====================
 async def main():
     print("🔗 Подключение к MCP серверу...")
     mcp_client = await get_mcp_client()
@@ -502,27 +516,27 @@ async def main():
 
     log_entry_tool = next((t for t in tools if t.name == "log_entry"), None)
     summary_tool = next((t for t in tools if t.name == "get_daily_summary"), None)
-    semantic_only_tool = next((t for t in tools if t.name == "search_semantic_only"), None)
+    search_word_tool = next((t for t in tools if t.name == "search_word"), None)
+    semantic_tool = next((t for t in tools if t.name == "search_semantic_only"), None)
     rerank_tool = next((t for t in tools if t.name == "search_with_rerank"), None)
-
     debug_tool = next((t for t in tools if t.name == "debug_paths"), None)
     rebuild_tool = next((t for t in tools if t.name == "rebuild_faiss_from_db"), None)
+    rebuild_fts_tool = next((t for t in tools if t.name == "rebuild_fts_from_db"), None)
 
     if not log_entry_tool:
         print("❌ log_entry tool не найден! Проверь сервер и путь /mcp")
-        return
-    if not semantic_only_tool:
-        print("❌ search_semantic_only tool не найден! Проверь сервер.")
         return
 
     ctx = {
         "llm": llm,
         "log_entry_tool": log_entry_tool,
         "summary_tool": summary_tool,
-        "semantic_only_tool": semantic_only_tool,
+        "search_word_tool": search_word_tool,
+        "semantic_tool": semantic_tool,
         "rerank_tool": rerank_tool,
         "debug_tool": debug_tool,
         "rebuild_tool": rebuild_tool,
+        "rebuild_fts_tool": rebuild_fts_tool,
     }
 
     graph = build_graph()
@@ -531,10 +545,10 @@ async def main():
     print("Команды:")
     print(" - Напиши текст записи → потом оцени 1–5")
     print(" - 'сводка' / 'итог' / дата YYYY-MM-DD / 'сегодня' → сводка дня")
-    print(" - 'найди ...' → семантический поиск (FAISS)")
-    print(" - 'найди! ...' → семантический + rerank")
+    print(" - 'найди <слово/слова>' → поиск по словам (FTS5 + prefix + LIKE fallback)")
+    print(" - 'найди! <запрос>' → смысловой поиск (FAISS + rerank)")
     print(" - 'paths' → показать пути + faiss_ntotal")
-    print(" - 'reindex' → пересобрать FAISS из SQLite")
+    print(" - 'reindex' → пересобрать FAISS и FTS")
     print(" - 'выход' → выйти")
 
     state: DiaryState = {"pending_text": None}
@@ -543,16 +557,18 @@ async def main():
         user = input("\nТы: ").strip()
         state["user_input"] = user
 
+        _append_jsonl(CONVO_LOG_FILE, {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "role": "user", "text": user})
+
         new_state = await graph.ainvoke(state, config={"configurable": {"ctx": ctx}})
         out = (new_state.get("out_text") or "").strip()
         if out:
             print("\n" + out)
+            _append_jsonl(CONVO_LOG_FILE, {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "role": "assistant", "text": out, "route": new_state.get("route")})
 
         state.update(new_state)
 
         if new_state.get("route") == "exit":
             break
-
 
 if __name__ == "__main__":
     asyncio.run(main())
